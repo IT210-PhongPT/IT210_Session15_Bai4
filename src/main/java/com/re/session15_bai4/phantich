@@ -1,0 +1,138 @@
+PHÂN TÍCH BÀI TẬP: TỐI ƯU HÓA CẬP NHẬT GIÁ HÀNG LOẠT
+
+PHẦN A - PHÂN TÍCH & ĐỀ XUẤT
+================================================================
+
+I. PHÂN TÍCH INPUT / OUTPUT
+----------------------------------------------------------------
+
+INPUT - Dữ liệu Controller truyền xuống Service:
+
+    Tham số             Kiểu        Ví dụ           Mô tả
+    ----------------    --------    ------------    ----------------------------
+    categoryName        String      "Laptop"        Tên danh mục cần giảm giá
+    discountPercentage  Double      15.0            % giảm giá (hợp lệ: 0 < x <= 100)
+
+OUTPUT - Kết quả trả về từ Service lên Controller:
+
+    Trường hợp          Kiểu trả về     Nội dung
+    ----------------    -----------     ------------------------------------
+    Thành công          int             Số sản phẩm được cập nhật (> 0)
+    Bẫy 1 bị kích       Exception       InvalidDiscountException (% âm hoặc > 100)
+    Bẫy 2 bị kích       Exception       CategoryNotFoundException (0 sản phẩm khớp)
+
+
+II. ĐỀ XUẤT 2 GIẢI PHÁP SPRING DATA JPA
+----------------------------------------------------------------
+
+--- Giải pháp 1: Load toàn bộ Entity lên RAM rồi cập nhật ---
+
+Cách hoạt động:
+    1. Gọi findByCategoryAndStatus("Laptop", "ACTIVE")
+       → Hibernate SELECT 50.000 bản ghi → nạp vào RAM thành List<Product>
+    2. Dùng vòng lặp for/stream set lại giá mới cho từng entity:
+           product.setPrice(oldPrice - oldPrice * discount / 100)
+    3. Gọi saveAll(products) hoặc để Dirty Checking tự commit
+       → Hibernate sinh ra 50.000 câu UPDATE riêng lẻ gửi xuống DB
+
+Repository cần:
+    List<Product> findByCategoryAndStatus(String category, String status);
+
+
+--- Giải pháp 2: Bulk UPDATE trực tiếp bằng JPQL (@Modifying + @Query) ---
+
+Cách hoạt động:
+    1. Viết một câu JPQL UPDATE duy nhất có tham số
+    2. Hibernate dịch thành 1 câu SQL UPDATE ... WHERE ... gửi xuống DB
+    3. DB tự tính toán và cập nhật toàn bộ 50.000 bản ghi trong 1 lần
+
+Repository cần:
+    @Modifying
+    @Transactional
+    @Query("UPDATE Product p SET p.price = p.price - (p.price * :discount / 100) " +
+           "WHERE p.category = :category AND p.status = 'ACTIVE'")
+    int bulkUpdatePrice(@Param("category") String category,
+                        @Param("discount") Double discount);
+
+
+================================================================
+PHẦN B - SO SÁNH VÀ LỰA CHỌN
+================================================================
+
+Tiêu chí                    Giải pháp 1 (Load RAM)          Giải pháp 2 (Bulk JPQL)
+--------------------------  ------------------------------  ------------------------------
+Bộ nhớ RAM                  RẤT CAO                         RẤT THẤP
+                            50.000 entity được nạp vào      Không load entity nào lên RAM
+                            Persistence Context, mỗi        Chỉ gửi 1 câu SQL xuống DB
+                            entity ~1-2KB → ~50-100MB RAM
+
+Tốc độ thực thi             CHẬM                            NHANH
+                            1 SELECT lấy 50.000 bản ghi     1 câu UPDATE duy nhất
+                            + 50.000 câu UPDATE riêng lẻ    DB xử lý toàn bộ nội bộ
+                            Tổng: ~50.001 câu SQL           Tổng: 1 câu SQL
+
+Rủi ro đồng bộ dữ liệu     CÓ RỦI RO                       CÓ RỦI RO (cần lưu ý)
+                            50.000 entity nằm trong         @Modifying bypass Persistence
+                            Persistence Context, nếu có     Context → cache 1st level
+                            lỗi giữa chừng, trạng thái      của Hibernate bị lỗi thời
+                            cache và DB có thể lệch nhau    → Cần clearAutomatically=true
+
+Khả năng mở rộng            KÉM                             TỐT
+                            Nếu tăng lên 500.000 bản ghi    Thời gian không tăng tuyến
+                            → RAM và thời gian tăng tuyến   tính theo số lượng bản ghi
+                            tính, có thể gây OutOfMemory
+
+Phù hợp khi nào             Số lượng bản ghi nhỏ (<1.000)   Số lượng bản ghi lớn (>10.000)
+                            Cần chạy business logic phức     Chỉ cần UPDATE đơn giản
+                            tạp trên từng entity trước khi  Ưu tiên hiệu năng
+                            lưu
+
+
+CHỐT LỰA CHỌN: GIẢI PHÁP 2 - Bulk UPDATE bằng JPQL
+
+Lý do:
+    - 50.000 bản ghi là con số lớn, Giải pháp 1 sẽ tiêu tốn
+      ~50-100MB RAM chỉ để chứa entity, chưa kể overhead của
+      Persistence Context quản lý Dirty Checking 50.000 đối tượng.
+    - Logic cập nhật giá đơn giản (một phép tính số học),
+      không cần load entity lên để xử lý business logic phức tạp.
+    - Giải pháp 2 chỉ sinh 1 câu SQL, tốc độ nhanh hơn hàng
+      nghìn lần, không có rủi ro OutOfMemoryError.
+    - Thêm clearAutomatically = true vào @Modifying để đảm bảo
+      Persistence Context được làm sạch sau khi bulk update.
+
+
+================================================================
+PHẦN C - THIẾT KẾ LUỒNG VÀ TRIỂN KHAI CODE
+================================================================
+
+LUỒNG XỬ LÝ TẠI TẦNG SERVICE
+----------------------------------------------------------------
+
+Bước 1:  Nhận Input (categoryName, discountPercentage) từ Controller
+
+Bước 2:  [BẪY 1] Kiểm tra discountPercentage hợp lệ
+            Nếu discountPercentage <= 0 HOẶC discountPercentage > 100
+            → ném InvalidDiscountException
+            → DỪNG, không xuống DB
+
+Bước 3:  [BẪY 2 - phần 1] Kiểm tra categoryName không rỗng/null
+            Nếu null hoặc blank
+            → ném IllegalArgumentException
+            → DỪNG, không xuống DB
+
+Bước 4:  Gọi Repository:
+            int updatedCount = productRepository
+                .bulkUpdatePrice(categoryName, discountPercentage)
+
+Bước 5:  [BẪY 2 - phần 2] Kiểm tra kết quả trả về
+            Nếu updatedCount == 0
+            → ném CategoryNotFoundException
+              ("Không tìm thấy sản phẩm ACTIVE nào trong danh mục: " + categoryName)
+
+Bước 6:  Trả về updatedCount về Controller
+            Controller hiển thị: "Đã cập nhật thành công X sản phẩm"
+
+Xem file ProductRepository.java và ProductService.java để biết chi tiết code.
+
+================================================================
